@@ -15,35 +15,44 @@ model.eval()
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
- #   transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+#   transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-
-
-
 
 # Function to create embedding from an image
 def create_image_embedding(image_path):
-    image = Image.open(image_path).convert('RGB')
-    inputs = processor(images=image, return_tensors="pt", padding=True, truncation=True, use_fast=True)
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(images=image, return_tensors="pt")
+
     with torch.no_grad():
         outputs = model.get_image_features(**inputs)
-    return outputs.numpy().flatten()
+
+        if hasattr(outputs, "pooler_output"):
+            image_features = outputs.pooler_output
+        else:
+            image_features = outputs
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    return image_features.cpu().numpy().flatten()   
 
 def create_text_embedding(text):
-
-    # Process the text
     inputs = processor(text=[text], return_tensors="pt", padding=True, truncation=True)
 
-    # Generate embedding
     with torch.no_grad():
-        text_features = model.get_text_features(**inputs)
-        # Normalize the embedding (CLIP embeddings are typically normalized)
+        outputs = model.get_text_features(**inputs)
+
+        # If transformers returns an object instead of tensor
+        if hasattr(outputs, "pooler_output"):
+            text_features = outputs.pooler_output
+        elif hasattr(outputs, "last_hidden_state"):
+            text_features = outputs.last_hidden_state[:, 0, :]
+        else:
+            text_features = outputs  # already tensor
+
+        # Normalize
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-    # Convert to numpy array
-    embedding = text_features.cpu().numpy().flatten()
-
-    return embedding
+    return text_features.cpu().numpy().flatten()
 
 
 def add_embeddings(json_file):

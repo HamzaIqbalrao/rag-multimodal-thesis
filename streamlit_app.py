@@ -73,7 +73,7 @@ def format_park_name(park_id: str) -> str:
     return park_id.replace('_', ' ').title()
 
 
-def display_search_results(search_results: List[Dict[str, Any]]):
+def display_search_results(search_results: List[Dict[str, Any]], images_dir:str):
     """Display search results in a grid layout with 3 images per row"""
     if not search_results:
         st.info("No images found for your search.")
@@ -108,7 +108,7 @@ def display_search_results(search_results: List[Dict[str, Any]]):
                     park_name = format_park_name(park_id)
 
                     # Image path
-                    image_path = f"/Users/alexanderdavila/PycharmProjects/MMRAG_blog/pythonProject1/images_metadata/{image_filename}"
+                    image_path = os.path.join(images_dir, image_filename)
 
                     # Load and display image
                     image = load_image_safe(image_path)
@@ -125,9 +125,11 @@ def display_search_results(search_results: List[Dict[str, Any]]):
 
 def main():
     load_dotenv()
-    host = os.getenv('ES_HOST')
-    api_key = os.getenv('ES_API_KEY')
+    es_host = os.getenv('ES_HOST')
+    es_username = os.getenv('ES_USERNAME')
+    es_password = os.getenv('ES_PASSWORD')
     index = os.getenv('ES_INDEX')
+    images_dir = os.getenv('IMAGES_DIR', 'images_metadata')
     # App header
     st.title("🏔️ National Parks Activity Finder")
     st.markdown("Discover amazing activities and locations in America's National Parks!")
@@ -167,7 +169,7 @@ def main():
         with st.spinner("Searching national parks..."):
             try:
 
-                response, search_results = process_parks_query(query, host, api_key)
+                response, search_results = process_parks_query(query, es_host, es_username, es_password)
 
                 st.session_state.llm_response = response
                 st.session_state.search_results = search_results
@@ -191,7 +193,7 @@ def main():
 
     # Display search results
     if st.session_state.search_results:
-        display_search_results(st.session_state.search_results)
+        display_search_results(st.session_state.search_results, images_dir)
 
     # Sidebar with app information
     with st.sidebar:

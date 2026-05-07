@@ -1,7 +1,9 @@
 from clip_processor import *
 from elasticsearch import Elasticsearch
 import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def list_metadata_files(path):
     files = []
@@ -23,11 +25,26 @@ def upload_document(es: Elasticsearch, doc, index):
 
 
 def index_logic():
-    host = os.getenv('ES_HOST')
-    api_key = os.getenv('ES_API_KEY')
-    index = os.getenv('ES_INDEX')
+    es_host = os.getenv("ES_HOST")
+    es_username = os.getenv("ES_USERNAME")
+    es_password = os.getenv("ES_PASSWORD")
+    index = os.getenv("ES_INDEX")
 
-    es = Elasticsearch(hosts=host, api_key=api_key)
+    if not es_host:
+        raise ValueError("ES_HOST not set")
+    if not es_username:
+        raise ValueError("ES_USERNAME not set")
+    if not es_password:
+        raise ValueError("ES_PASSWORD not set")
+    if not index:
+        raise ValueError("ES_INDEX not set")
+
+    es = Elasticsearch(
+        hosts=[es_host],
+        basic_auth=(es_username, es_password),
+        verify_certs=False,
+        ssl_show_warn=False
+    )
 
     metadata_files = list_metadata_files('images_metadata/')
 

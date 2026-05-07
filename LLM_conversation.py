@@ -2,7 +2,9 @@ from ollama import chat
 from ollama import ChatResponse
 import json
 from typing import Dict, List, Any, Optional
+from elasticsearch import Elasticsearch
 from rag_search_execution import *
+import re
 
 
 index = os.getenv('ES_INDEX')
@@ -96,12 +98,25 @@ User query: {query}
         response: ChatResponse = chat(
             model=model_name,
             messages=[{'role': 'user', 'content': content}],
-            options={'temperature': 0}
+            options={'temperature': 0.3, 'think': False}  # Enable reasoning mode to help with extraction
         )
 
         if response and response['message']['content']:
-            extracted_data = json.loads(response['message']['content'])
+            response_text = response['message']['content']
+
+            # Strip <think>...</think> blocks produced by qwen3's reasoning mode
+            response_text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+
+            # Strip markdown code fences in case the model wraps JSON in ```json ... ```
+            response_text = re.sub(r'```json|```', '', response_text).strip()
+
+            if not response_text:
+                print("Error: LLM returned empty content after stripping think blocks")
+                return None
+
+            extracted_data = json.loads(response_text)
             return extracted_data
+
     except (json.JSONDecodeError, Exception) as e:
         print(f"Error extracting search parameters: {e}")
         return None
@@ -109,56 +124,69 @@ User query: {query}
     return None
 
 
-def search_parks_elasticsearch(search_params: Dict[str, Any], host, api_key) -> List[Dict[str, Any]]:
-    """Execute Elasticsearch searches for relevant parks"""
+def find_nearest_park(geolocation: Dict[str, Any], parks: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    if not geolocation or 'lat' not in geolocation or 'lon' not in geolocation:
+        return None
+
+    best_park = None
+    best_distance = float('inf')
+    lat1 = geolocation['lat']
+    lon1 = geolocation['lon']
+
+    for park_id, info in parks.items():
+        lat2, lon2 = info['coordinates']
+        dist = (lat1 - lat2) ** 2 + (lon1 - lon2) ** 2
+        if dist < best_distance:
+            best_distance = dist
+            best_park = park_id
+
+    return best_park
+
+
+def search_parks_elasticsearch(search_params: Dict[str, Any], es_host, es_username, es_password) -> List[Dict[str, Any]]:
+    """Execute a combined Elasticsearch search for the requested parks."""
     index_name = os.getenv('ES_INDEX')
 
-    # Get relevant parks or use all parks if none specified
-    relevant_parks = search_params.get('relevant_parks', [])
+    relevant_parks = search_params.get('relevant_parks', []) or list(national_parks.keys())
+    relevant_parks = [park_id for park_id in relevant_parks if park_id in national_parks]
     if not relevant_parks:
         relevant_parks = list(national_parks.keys())
 
-    search_text = search_params.get('context_search', '')
+    park_coordinates = [national_parks[park_id]['coordinates'] for park_id in relevant_parks]
+    search_text = search_params.get('context_search', '').strip() or search_params.get('location_type', '').strip() or ''
     search_distance = f"{search_params.get('distance_km', 100)}km"
 
-    print(f"Searching {len(relevant_parks)} parks for: '{search_text}'")
+    print(f"Searching {len(relevant_parks)} parks for: '{search_text}' within {search_distance}")
 
-    for park_id in relevant_parks:
-        all_results = []
-        if park_id not in national_parks:
-            continue
+    es = Elasticsearch(
+        hosts=[es_host],
+        basic_auth=(es_username, es_password),
+        verify_certs=False,
+        ssl_show_warn=False
+    )
+    search_results = rrf_search(
+        es_client=es,
+        index_name=index_name,
+        park_coordinates=park_coordinates,
+        distance=search_distance,
+        text_query=search_text
+    )
 
-        park_info = national_parks[park_id]
-        latitude, longitude = park_info['coordinates']
+    all_results = []
+    for result in search_results:
+        source = dict(result['_source']) if '_source' in result else {}
+        nearest_park = find_nearest_park(source.get('geolocation', {}), national_parks)
+        park_id = nearest_park or relevant_parks[0]
+        park_info = national_parks.get(park_id, {})
 
-        try:
-            # Execute the search for this park
-            search_results = rrf_search(
-                host=host,
-                api_key=api_key,
-                index_name=index_name,
-                lat=latitude,
-                lon=longitude,
-                distance=search_distance,
-                text_query=search_text
-            )
-
-            # Add park context to results
-            for result in search_results:
-                result["image_filename"] = result["_source"]["image_filename"]
-                result["generated_description"] = result["_source"]["generated_description"]
-                result['park_id'] = park_id
-                result['park_state'] = park_info['state']
-                result['park_coordinates'] = park_info['coordinates']
-                del result["_source"]
-
-
-                all_results.append(result)
-            print(f"Found {len(all_results)} results for {park_id}")
-
-        except Exception as e:
-            print(f"Error searching {park_id}: {e}")
-            continue
+        all_results.append({
+            'image_filename': source.get('image_filename'),
+            'generated_description': source.get('generated_description'),
+            'park_id': park_id,
+            'park_state': park_info.get('state'),
+            'park_coordinates': park_info.get('coordinates'),
+            '_score': result['_score'] if '_score' in result else None
+        })
 
     return all_results
 
@@ -172,11 +200,11 @@ def generate_response(original_query: str, search_results: List[Dict[str, Any]],
         results_text = "No results found for your query."
     else:
         results_text = "Search Results:\n"
-        for result in search_results:
+        for result in search_results[:5]:
             score = result['_score']
             # Adjust these field names based on your Elasticsearch document structure
             title = result['image_filename']
-            content_snippet = result['generated_description'][:200] + "..."
+            content_snippet = result['generated_description'][:150] + "..."
 
             results_text += f"   Title: {title}\n"
             results_text += f"   Content: {content_snippet}\n"
@@ -210,7 +238,8 @@ Response:"""
         response: ChatResponse = chat(
             model=model_name,
             messages=[{'role': 'user', 'content': content}],
-            options={'temperature': 0.3}  # Slightly higher temperature for more natural responses
+            options={'temperature': 0.3,
+                     'num_predict' : 300}  # Slightly higher temperature for more natural responses
         )
 
         if response and response['message']['content']:
@@ -222,19 +251,26 @@ Response:"""
     return "I wasn't able to generate a proper response. Please try rephrasing your question."
 
 
-def process_parks_query(user_query: str, host, api_key) -> str:
+def process_parks_query(user_query: str, es_host, es_username, es_password) -> str:
     """Main function to process a user query end-to-end"""
     print(f"Processing query: {user_query}")
 
     # Step 1: Extract search parameters
     search_params = extract_search_parameters(user_query)
     if not search_params:
-        return "I'm sorry, I couldn't understand your query. Please try rephrasing it."
+        print("Search parameter extraction failed; falling back to a direct query search.")
+        search_params = {
+            'context_search': user_query,
+            'distance_km': 100,
+            'location_type': None,
+            'reference_location': None,
+            'relevant_parks': []
+        }
 
     print(f"Extracted parameters: {search_params}")
 
     # Step 2: Execute searches across relevant parks
-    search_results = search_parks_elasticsearch(search_params, host, api_key)
+    search_results = search_parks_elasticsearch(search_params, es_host, es_username, es_password)
 
     # Step 3: Generate final response
     final_response = generate_response(user_query, search_results, search_params)

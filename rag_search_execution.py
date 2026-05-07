@@ -7,80 +7,62 @@ import os
 index = os.getenv('ES_INDEX')
 
 
-def rrf_search(host, api_key, index_name, lat, lon, distance, text_query, k=10,
-               num_candidates=100):
+def _build_geo_filter_for_parks(parks_coordinates, distance):
+    if not parks_coordinates:
+        return Q('match_all')
+
+    if len(parks_coordinates) == 1:
+        lat, lon = parks_coordinates[0]
+        return Q('geo_distance', distance=distance, geolocation={'lat': lat, 'lon': lon})
+
+    geo_queries = [
+        Q('geo_distance', distance=distance, geolocation={'lat': lat, 'lon': lon})
+        for lat, lon in parks_coordinates
+    ]
+    return Q('bool', should=geo_queries, minimum_should_match=1)
+
+
+def rrf_search(es_client, index_name, park_coordinates, distance, text_query, k=5,
+               num_candidates=30):
     """
-    Create an RRF search object bound to a specific index.
+    Execute a combined Elasticsearch bool search for multiple parks.
 
     Args:
+        es_client: Elasticsearch client instance
         index_name (str): Name of the Elasticsearch index
-        lat (float): Latitude for geo filtering
-        lon (float): Longitude for geo filtering
+        park_coordinates (List[Tuple[float, float]]): Coordinates for park geo filters
         distance (int/str): Distance for geo filtering
         text_query (str): Text to search in description fields
-        k (int): Number of top results for KNN search
-        num_candidates (int): Number of candidates for KNN search
+        k (int): Number of top results for KNN search (unused when RRF is disabled)
+        num_candidates (int): Number of candidates for KNN search (unused when RRF is disabled)
 
     Returns:
-        Search: elasticsearch_dsl Search object ready to execute
+        List[dict]: Elasticsearch hit documents
     """
 
-    embedding = create_text_embedding(text_query).tolist()
-    # Create geo distance query
-    geo_filter = Q('geo_distance',
-                   distance=distance,
-                   geolocation={'lat': lat, 'lon': lon})
+    text_query = (text_query or '').strip()
+    geo_filter = _build_geo_filter_for_parks(park_coordinates, distance)
 
-    # Create text search queries
-    text_queries = [
-        Q('match', generated_description=text_query),
-        Q('match', description=text_query)
-    ]
+    if text_query:
+        embedding = create_text_embedding(text_query).tolist()
+        text_queries = [
+            Q('match', generated_description={'query': text_query, 'boost': 2}),
+            Q('match', description={'query': text_query})
+        ]
+        standard_query = Q('bool', filter=[geo_filter], should=text_queries, minimum_should_match=1)
+    else:
+        standard_query = Q('bool', filter=[geo_filter])
 
-    # Create boolean query for standard search
-    standard_query = Q('bool', filter=[geo_filter], should=text_queries)
+    s = Search(using=es_client, index=index_name)
+    s = s.source(["image_filename", "generated_description", "geolocation"])
 
-    # Create search object bound to index
-    s = Search(index=index_name)
-    s = s.source(["image_filename", "generated_description"])
+    if text_query:
+        s = s.query(standard_query)
+    else:
+        s = s.query(standard_query)
 
-    # Build RRF configuration
-    retrievers = [
-        # Standard retriever
-        {
-            "standard": {
-                "query": standard_query.to_dict()
-            }
-        },
-        # Text KNN retriever
-        {
-            "knn": {
-                "filter": geo_filter.to_dict(),
-                "field": "text_embedding",
-                "query_vector": embedding,
-                "k": k,
-                "num_candidates": num_candidates
-            }
-        },
-        # Image KNN retriever
-        {
-            "knn": {
-                "filter": geo_filter.to_dict(),
-                "field": "image_embedding",
-                "query_vector": embedding,
-                "k": k,
-                "num_candidates": num_candidates
-            }
-        }
-    ]
-
-    # Apply RRF configuration
-    s = s.extra(retriever={'rrf': {'retrievers': retrievers}}, size=3)
-
-    es = Elasticsearch(hosts=host, api_key=api_key)
-
-    results = s.using(es).execute()["hits"]["hits"]
-
+    s = s[:5]
+    results = s.execute()["hits"]["hits"]
     return results
 
 
